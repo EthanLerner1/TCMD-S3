@@ -38,26 +38,20 @@ end;
 
 function TS3TcPath.StripAnyBucket(const aRemoteName: string): string;
 begin
-  const LBucketName = GetBucketName(aRemoteName);
-
-  Result :=
-      aRemoteName
-        .TrimLeft(['\'])
-        .Replace(LBucketName,'')
-        .TrimLeft(['\'])
-        .Replace('\','/');
-
+  // Drop ONLY the leading bucket segment, not every occurrence of the bucket
+  // name. A naive Replace(BucketName,'') mangles folders/keys that share the
+  // bucket's name (or contain it as a substring), which breaks navigation.
+  var Slugs := aRemoteName.TrimLeft(['\']).TrimRight(['\']).Split(['\']);
+  if Length(Slugs) <= 1 then
+    Exit('');
+  Result := string.Join('/', Slugs, 1, Length(Slugs) - 1);
 end;
 
 function TS3TcPath.StripKnownBucket(const aRemoteName: string): string;
 begin
-  Result :=
-      aRemoteName
-        .TrimLeft(['\'])
-        .Replace(BucketName,'')
-        .TrimLeft(['\'])
-        .Replace('\','/');
-
+  // The first path segment is always the bucket, so stripping by position is
+  // equivalent and safe. Same fix as StripAnyBucket.
+  Result := StripAnyBucket(aRemoteName);
 end;
 
 function TS3TcPath.IsBucket(const aRemoteName: string): Boolean;
