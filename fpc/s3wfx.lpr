@@ -11,16 +11,23 @@ type
     IsDir: Boolean;
     Size: Int64;
   end;
+  // Total Commander's progress callback: returns 1 if the user wants to abort.
+  TProgressProcW = function(PluginNr: Integer; Source, Target: PWideChar;
+    PercentDone: Integer): Integer; stdcall;
 
 const
   FS_FILE_OK           = 0;
   FS_FILE_READERROR    = 3;
+  FS_FILE_USERABORT    = 5;
   FS_FILE_NOTSUPPORTED = 6;
 
 var
   gS3: TS3Client = nil;
   gList: array of TEntry;
   gIndex: Integer = -1;
+  gProgressProc: TProgressProcW = nil;
+  gPluginNr: Integer = 0;
+  gCurSource, gCurTarget: WideString;
 
 // ---- credentials (credentials file wins, else config) --------------------
 function ReadIni(const Path, Section, Key: string): string;
@@ -184,9 +191,23 @@ begin
   if n > 0 then Move(w[1], fd.cFileName, n * SizeOf(WideChar));
 end;
 
+// Bridges fpcs3's byte-count callback to TC's percent/abort callback.
+// Single transfer at a time, so module globals are fine.
+function ProgressBridge(BytesDone, BytesTotal: Int64): Boolean;
+var pct: Integer;
+begin
+  if BytesTotal > 0 then pct := Integer((BytesDone * 100) div BytesTotal) else pct := 0;
+  if Assigned(gProgressProc) then
+    Result := gProgressProc(gPluginNr, PWideChar(gCurSource), PWideChar(gCurTarget), pct) = 1
+  else
+    Result := False;
+end;
+
 // ---- WFX exports ---------------------------------------------------------
 function FsInitW(PluginNr: Integer; pProgress, pLog, pRequest: Pointer): Integer; stdcall;
 begin
+  gPluginNr := PluginNr;
+  gProgressProc := TProgressProcW(pProgress);
   Result := 0;
 end;
 
@@ -224,7 +245,7 @@ end;
 
 function FsGetFileW(RemoteName, LocalName: PWideChar; CopyFlags: Integer;
   RemoteInfo: Pointer): Integer; stdcall;
-var bucket, prefix, key: string; status: Integer;
+var bucket, prefix, key: string; status: Integer; aborted: Boolean;
 begin
   if not EnsureClient then Exit(FS_FILE_READERROR);
   SplitPath(WideString(RemoteName), bucket, prefix);
@@ -233,8 +254,15 @@ begin
   key := prefix;
   if (key <> '') and (key[Length(key)] = '/') then Delete(key, Length(key), 1);
   if key = '' then Exit(FS_FILE_NOTSUPPORTED);
-  if gS3.GetObjectToFile(bucket, key, WideString(LocalName), status) and (status = 200) then
+
+  gCurSource := WideString(RemoteName);
+  gCurTarget := WideString(LocalName);
+  aborted := False;
+  if gS3.GetObjectToFile(bucket, key, WideString(LocalName), status,
+       @ProgressBridge, @aborted) and (status = 200) then
     Result := FS_FILE_OK
+  else if aborted then
+    Result := FS_FILE_USERABORT
   else
     Result := FS_FILE_READERROR;
 end;

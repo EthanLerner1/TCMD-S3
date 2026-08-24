@@ -17,6 +17,17 @@ var
   FindClose_: TFindClose;
   GetFile_: TGetFile;
   InitW_: TInitW;
+  gCalls: Integer = 0;
+  gAbort: Boolean = False;
+
+// Stand-in for Total Commander's progress callback.
+function MyProgress(PluginNr: Integer; Source, Target: PWideChar;
+  Percent: Integer): Integer; stdcall;
+begin
+  Inc(gCalls);
+  writeln('    progress: ', Percent, '%');
+  if gAbort then Result := 1 else Result := 0;   // 1 = user wants to abort
+end;
 
 function NameOf(const fd: TWin32FindDataW): string;
 begin
@@ -56,26 +67,35 @@ begin
   FindClose_ := TFindClose(GetProcAddress(h, 'FsFindClose'));
   GetFile_   := TGetFile(GetProcAddress(h, 'FsGetFileW'));
 
-  InitW_(0, nil, nil, nil);
+  InitW_(0, @MyProgress, nil, nil);                // register progress callback
 
   ListDir('\');                                    // buckets
   ListDir('\hydra-build\');                        // bucket root
   ListDir('\hydra-build\hydra-build\');            // folder named like the bucket (the bug)
 
-  // download through FsGetFileW
-  local := GetTempDir + 'wfxdl.bin';
-  writeln('--- FsGetFileW download ---');
+  // Big streaming download (8.7 MB): proves constant memory + progress firing.
+  local := GetTempDir + 'wfxbig.bin';
+  gCalls := 0; gAbort := False;
+  writeln('--- FsGetFileW streaming download (8.7 MB) ---');
   r := GetFile_(
-    PWideChar(WideString('\hydra-build\hydra-build\linux-build\models\RTX40\features\voice\wav2vec2\config.json')),
+    PWideChar(WideString('\hydra-build\hydra-build\linux-build\models\RTX40\features\voice\DeepFilterNet3.pt')),
     PWideChar(WideString(local)), 0, nil);
   sz := 0;
   if FileExists(local) then
-  begin
-    fs := TFileStream.Create(local, fmOpenRead);
-    try sz := fs.Size; finally fs.Free; end;
-  end;
-  writeln('  result=', r, '  bytes=', sz, '  (expected 0 / 1568)');
-  if (r = 0) and (sz = 1568) then writeln('  GETFILE OK') else writeln('  GETFILE FAIL');
+  begin fs := TFileStream.Create(local, fmOpenRead); try sz := fs.Size; finally fs.Free; end; end;
+  writeln('  result=', r, '  bytes=', sz, '  (expected 0 / 8714073)  progress-calls=', gCalls);
+  if (r = 0) and (sz = 8714073) and (gCalls > 0) then writeln('  STREAM+PROGRESS OK')
+  else writeln('  FAIL');
+
+  // Abort mid-download: callback returns 1; expect USERABORT (5) + file removed.
+  local := GetTempDir + 'wfxabort.bin';
+  gCalls := 0; gAbort := True;
+  writeln('--- FsGetFileW abort test ---');
+  r := GetFile_(
+    PWideChar(WideString('\hydra-build\hydra-build\linux-build\models\RTX40\features\voice\DeepFilterNet3.pt')),
+    PWideChar(WideString(local)), 0, nil);
+  writeln('  result=', r, '  (expected 5=USERABORT)  file-exists=', FileExists(local));
+  if (r = 5) and (not FileExists(local)) then writeln('  ABORT OK') else writeln('  ABORT FAIL');
 
   FreeLibrary(h);
 end.

@@ -7,15 +7,22 @@ interface
 uses SysUtils, Classes, fpcs3_hash;
 
 type
+  // Called periodically during a transfer with bytes-so-far / total (total may
+  // be 0 if unknown). Return True to abort. Plain function so it can bridge to
+  // Total Commander's C-style progress callback.
+  TS3Progress = function(BytesDone, BytesTotal: Int64): Boolean;
+
   TS3Client = class
   private
     FAccess, FSecret, FRegion: string;
     // Core signed request. Payload is the request body (empty for GET/DELETE).
-    // Response body is written raw to RespStream. On a region redirect the
-    // actual bucket region is returned in BucketRegion so the caller can retry.
+    // Response body is STREAMED raw to RespStream (never buffered whole), so a
+    // multi-GB download uses constant memory. On a region redirect the actual
+    // bucket region is returned in BucketRegion so the caller can retry.
     function SignedRequest(const Method, Host, CanonicalUri, CanonicalQuery: string;
       const Payload: TBytes; RespStream: TStream;
-      out StatusCode: Integer; out BucketRegion: string): Boolean;
+      out StatusCode: Integer; out BucketRegion: string;
+      Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil): Boolean;
   public
     constructor Create(const AAccess, ASecret, ARegion: string);
     property Region: string read FRegion write FRegion;
@@ -25,7 +32,8 @@ type
     function ListObjectsXML(const Bucket, Prefix: string;
       out Body: string; out Status: Integer): Boolean;
     function GetObjectToFile(const Bucket, Key, LocalFile: string;
-      out Status: Integer): Boolean;
+      out Status: Integer; Progress: TS3Progress = nil;
+      AbortedPtr: PBoolean = nil): Boolean;
   end;
 
 function UriEncode(const S: string; EncodeSlash: Boolean): string;
@@ -71,6 +79,16 @@ begin
     Result := Copy(buf, 1, len div SizeOf(Char));
 end;
 
+// Read a standard response header (by HTTP_QUERY_* flag) as a string.
+function QueryInfoStr(hRequest: HINTERNET; flag: DWORD): string;
+var buf: array[0..127] of Char; len, idx: DWORD;
+begin
+  Result := '';
+  len := SizeOf(buf); idx := 0;
+  if HttpQueryInfo(hRequest, flag, @buf[0], len, idx) then
+    Result := Copy(buf, 1, len div SizeOf(Char));
+end;
+
 constructor TS3Client.Create(const AAccess, ASecret, ARegion: string);
 begin
   FAccess := AAccess; FSecret := ASecret; FRegion := ARegion;
@@ -83,19 +101,22 @@ end;
 
 function TS3Client.SignedRequest(const Method, Host, CanonicalUri, CanonicalQuery: string;
   const Payload: TBytes; RespStream: TStream;
-  out StatusCode: Integer; out BucketRegion: string): Boolean;
+  out StatusCode: Integer; out BucketRegion: string;
+  Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
 var
   amzDate, dateStamp, scope, canonicalHeaders, signedHeaders: string;
   canonicalRequest, stringToSign, authHeader, headers, payloadHash: string;
   kDate, kRegion, kService, kSigning, sig: TBytes;
   hSession, hConnect, hRequest: HINTERNET;
   flags: DWORD;
-  buf: array[0..16383] of Byte;
+  buf: array[0..65535] of Byte;
   bytesRead: DWORD;
   statusBuf, statusLen, idx: DWORD;
   optPtr: Pointer; optLen: DWORD;
+  total, done, lastReport: Int64;
 begin
   Result := False; StatusCode := 0; BucketRegion := '';
+  if AbortedPtr <> nil then AbortedPtr^ := False;
   UtcNowStamp(amzDate, dateStamp);
 
   if Length(Payload) = 0 then
@@ -161,9 +182,25 @@ begin
           StatusCode := statusBuf;
 
         BucketRegion := QueryHeader(hRequest, 'x-amz-bucket-region');
+        total := StrToInt64Def(Trim(QueryInfoStr(hRequest, HTTP_QUERY_CONTENT_LENGTH)), 0);
 
+        // Stream body straight to RespStream; never buffer the whole object.
+        done := 0; lastReport := 0;
         while InternetReadFile(hRequest, @buf[0], SizeOf(buf), bytesRead) and (bytesRead > 0) do
+        begin
           RespStream.WriteBuffer(buf[0], bytesRead);
+          Inc(done, bytesRead);
+          // report roughly every 1 MB so a huge file doesn't flood the callback
+          if Assigned(Progress) and (done - lastReport >= 1024*1024) then
+          begin
+            lastReport := done;
+            if Progress(done, total) then
+            begin
+              if AbortedPtr <> nil then AbortedPtr^ := True;
+              Break;
+            end;
+          end;
+        end;
         Result := True;
       finally
         InternetCloseHandle(hRequest);
@@ -214,29 +251,41 @@ begin
 end;
 
 function TS3Client.GetObjectToFile(const Bucket, Key, LocalFile: string;
-  out Status: Integer): Boolean;
-var fs: TFileStream; ms: TMemoryStream; br, uri: string; attempt: Integer;
+  out Status: Integer; Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
+var fs: TFileStream; br, uri: string; attempt: Integer; aborted: Boolean;
 begin
   Result := False;
+  if AbortedPtr <> nil then AbortedPtr^ := False;
   uri := '/' + Bucket + '/' + UriEncode(Key, False);
   for attempt := 0 to 1 do
   begin
-    ms := TMemoryStream.Create;
+    aborted := False;
+    // Stream directly to disk: on a wrong-region first attempt this writes the
+    // small 301 error XML, which the retry truncates away (fmCreate). Constant
+    // memory regardless of object size.
+    fs := TFileStream.Create(LocalFile, fmCreate);
     try
-      Result := SignedRequest('GET', RegionHost, uri, '', nil, ms, Status, br);
-      if ((Status = 301) or (Status = 400)) and (br <> '') and (br <> FRegion) then
-      begin
-        FRegion := br;
-        Continue;               // retry with correct region, don't write file yet
-      end;
-      if Status = 200 then
-      begin
-        fs := TFileStream.Create(LocalFile, fmCreate);
-        try ms.Position := 0; fs.CopyFrom(ms, ms.Size); finally fs.Free; end;
-      end;
-    finally ms.Free; end;
+      SignedRequest('GET', RegionHost, uri, '', nil, fs, Status, br, Progress, @aborted);
+    finally fs.Free; end;
+
+    if aborted then
+    begin
+      if AbortedPtr <> nil then AbortedPtr^ := True;
+      SysUtils.DeleteFile(LocalFile);
+      Exit(False);
+    end;
+    if ((Status = 301) or (Status = 400)) and (br <> '') and (br <> FRegion) then
+    begin
+      FRegion := br;
+      Continue;                 // learned real region — retry once
+    end;
     Break;
   end;
+
+  if Status = 200 then
+    Result := True
+  else
+    SysUtils.DeleteFile(LocalFile);  // don't leave an error body masquerading as the file
 end;
 
 end.
