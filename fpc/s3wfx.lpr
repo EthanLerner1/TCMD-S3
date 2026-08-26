@@ -17,6 +17,7 @@ type
 
 const
   FS_FILE_OK           = 0;
+  FS_FILE_WRITEERROR   = 1;
   FS_FILE_READERROR    = 3;
   FS_FILE_USERABORT    = 5;
   FS_FILE_NOTSUPPORTED = 6;
@@ -267,13 +268,52 @@ begin
     Result := FS_FILE_READERROR;
 end;
 
+function FsPutFileW(LocalName, RemoteName: PWideChar; CopyFlags: Integer): Integer; stdcall;
+var bucket, prefix, key: string; status: Integer; aborted: Boolean;
+begin
+  if not EnsureClient then Exit(FS_FILE_WRITEERROR);
+  SplitPath(WideString(RemoteName), bucket, prefix);
+  if bucket = '' then Exit(FS_FILE_NOTSUPPORTED);
+  // RemoteName already ends in the filename, so SplitPath's prefix is the full
+  // key with a trailing '/'. Strip it — same trick FsGetFileW uses.
+  key := prefix;
+  if (key <> '') and (key[Length(key)] = '/') then Delete(key, Length(key), 1);
+  if key = '' then Exit(FS_FILE_NOTSUPPORTED);
+  // ponytail: no overwrite-check on CopyFlags — S3 PUT overwrites by default,
+  // which is the correct behaviour for a file copy here anyway.
+
+  gCurSource := WideString(LocalName);
+  gCurTarget := WideString(RemoteName);
+  aborted := False;
+  if gS3.PutObjectFromFile(bucket, key, WideString(LocalName), status,
+       @ProgressBridge, @aborted) and (status = 200) then
+    Result := FS_FILE_OK
+  else if aborted then
+    Result := FS_FILE_USERABORT
+  else
+    Result := FS_FILE_WRITEERROR;
+end;
+
+function FsMkDirW(Path: PWideChar): BOOL; stdcall;
+var bucket, prefix: string; status: Integer;
+begin
+  if not EnsureClient then Exit(False);
+  SplitPath(WideString(Path), bucket, prefix);
+  // ponytail: bucket='' means mkdir at the S3 root, i.e. create a bucket — out
+  // of scope. prefix already ends in '/', which is exactly the folder-marker key.
+  if (bucket = '') or (prefix = '') then Exit(False);
+  Result := gS3.CreateFolder(bucket, prefix, status) and (status = 200);
+end;
+
 exports
   FsInitW          name 'FsInitW',
   FsGetDefRootName name 'FsGetDefRootName',
   FsFindFirstW     name 'FsFindFirstW',
   FsFindNextW      name 'FsFindNextW',
   FsFindClose      name 'FsFindClose',
-  FsGetFileW       name 'FsGetFileW';
+  FsGetFileW       name 'FsGetFileW',
+  FsPutFileW       name 'FsPutFileW',
+  FsMkDirW         name 'FsMkDirW';
 
 begin
 end.

@@ -23,6 +23,11 @@ type
       const Payload: TBytes; RespStream: TStream;
       out StatusCode: Integer; out BucketRegion: string;
       Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil): Boolean;
+    // One streaming PUT attempt (UNSIGNED-PAYLOAD); PutObjectFromFile wraps it
+    // with the region-detect retry.
+    function PutOnce(const Bucket, Key, LocalFile: string;
+      out StatusCode: Integer; out BucketRegion: string;
+      Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil): Boolean;
   public
     constructor Create(const AAccess, ASecret, ARegion: string);
     property Region: string read FRegion write FRegion;
@@ -34,6 +39,16 @@ type
     function GetObjectToFile(const Bucket, Key, LocalFile: string;
       out Status: Integer; Progress: TS3Progress = nil;
       AbortedPtr: PBoolean = nil): Boolean;
+    // Streams the local file to S3 (constant memory) via PUT with
+    // x-amz-content-sha256: UNSIGNED-PAYLOAD, so we never hash the whole file.
+    function PutObjectFromFile(const Bucket, Key, LocalFile: string;
+      out Status: Integer; Progress: TS3Progress = nil;
+      AbortedPtr: PBoolean = nil): Boolean;
+    // Region-aware DELETE (empty body). Mainly so tests can clean up.
+    function DeleteObject(const Bucket, Key: string; out Status: Integer): Boolean;
+    // Region-aware PUT of an empty object at Key (Key ends in '/') — the S3
+    // folder-marker convention. Success = HTTP 200.
+    function CreateFolder(const Bucket, Key: string; out Status: Integer): Boolean;
   end;
 
 function UriEncode(const S: string; EncodeSlash: Boolean): string;
@@ -286,6 +301,194 @@ begin
     Result := True
   else
     SysUtils.DeleteFile(LocalFile);  // don't leave an error body masquerading as the file
+end;
+
+const
+  UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
+
+// One streaming PUT attempt. Signs with x-amz-content-sha256: UNSIGNED-PAYLOAD
+// (S3 allows this over HTTPS) so the file body never has to be hashed or
+// buffered. Content-Length is set via INTERNET_BUFFERS.dwBufferTotal and is NOT
+// a signed header, so it doesn't affect the signature. Returns the S3 region
+// on a 301/400 redirect via BucketRegion.
+function TS3Client.PutOnce(const Bucket, Key, LocalFile: string;
+  out StatusCode: Integer; out BucketRegion: string;
+  Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
+var
+  amzDate, dateStamp, scope, canonicalHeaders, signedHeaders: string;
+  canonicalRequest, stringToSign, authHeader, headers, host, uri: string;
+  kDate, kRegion, kService, kSigning, sig: TBytes;
+  hSession, hConnect, hRequest: HINTERNET;
+  flags: DWORD;
+  bufs: INTERNET_BUFFERS;
+  fs: TFileStream;
+  chunk: array[0..65535] of Byte;
+  readCnt: Integer; written: DWORD;
+  total, done, lastReport: Int64;
+  statusBuf, statusLen, idx: DWORD;
+begin
+  Result := False; StatusCode := 0; BucketRegion := '';
+  host := RegionHost;
+  uri := '/' + Bucket + '/' + UriEncode(Key, False);
+  UtcNowStamp(amzDate, dateStamp);
+
+  signedHeaders := 'host;x-amz-content-sha256;x-amz-date';
+  canonicalHeaders :=
+    'host:' + host + #10 +
+    'x-amz-content-sha256:' + UNSIGNED_PAYLOAD + #10 +
+    'x-amz-date:' + amzDate + #10;
+
+  // PUT, empty canonical query, payload hash = literal UNSIGNED-PAYLOAD.
+  canonicalRequest :=
+    'PUT' + #10 + uri + #10 + '' + #10 +
+    canonicalHeaders + #10 + signedHeaders + #10 + UNSIGNED_PAYLOAD;
+
+  scope := dateStamp + '/' + FRegion + '/s3/aws4_request';
+  stringToSign :=
+    'AWS4-HMAC-SHA256' + #10 + amzDate + #10 + scope + #10 +
+    ToHex(SHA256Str(canonicalRequest));
+
+  kDate    := HMACSHA256(StrToBytes('AWS4' + FSecret), StrToBytes(dateStamp));
+  kRegion  := HMACSHA256(kDate, StrToBytes(FRegion));
+  kService := HMACSHA256(kRegion, StrToBytes('s3'));
+  kSigning := HMACSHA256(kService, StrToBytes('aws4_request'));
+  sig      := HMACSHA256(kSigning, StrToBytes(stringToSign));
+
+  authHeader :=
+    'AWS4-HMAC-SHA256 Credential=' + FAccess + '/' + scope +
+    ', SignedHeaders=' + signedHeaders + ', Signature=' + ToHex(sig);
+
+  headers :=
+    'x-amz-date: ' + amzDate + #13#10 +
+    'x-amz-content-sha256: ' + UNSIGNED_PAYLOAD + #13#10 +
+    'Authorization: ' + authHeader + #13#10;
+
+  fs := TFileStream.Create(LocalFile, fmOpenRead or fmShareDenyWrite);
+  try
+    total := fs.Size;
+    hSession := InternetOpen('fpcs3/1.0', INTERNET_OPEN_TYPE_PRECONFIG, nil, nil, 0);
+    if hSession = nil then Exit;
+    try
+      hConnect := InternetConnect(hSession, PChar(host), INTERNET_DEFAULT_HTTPS_PORT,
+        nil, nil, INTERNET_SERVICE_HTTP, 0, 0);
+      if hConnect = nil then Exit;
+      try
+        flags := INTERNET_FLAG_SECURE or INTERNET_FLAG_RELOAD or
+                 INTERNET_FLAG_NO_CACHE_WRITE or INTERNET_FLAG_NO_AUTO_REDIRECT;
+        hRequest := HttpOpenRequest(hConnect, 'PUT', PChar(uri), nil, nil, nil, flags, 0);
+        if hRequest = nil then Exit;
+        try
+          FillChar(bufs, SizeOf(bufs), 0);
+          bufs.dwStructSize := SizeOf(bufs);
+          bufs.lpcszHeader := PChar(headers);
+          bufs.dwHeadersLength := Length(headers);
+          // ponytail: dwBufferTotal is a 32-bit DWORD, so a single-PUT upload
+          // tops out at 4GB. For >4GB, switch to S3 multipart upload.
+          bufs.dwBufferTotal := DWORD(total);   // Content-Length (unsigned header)
+
+          if not HttpSendRequestEx(hRequest, @bufs, nil, 0, 0) then Exit;
+
+          done := 0; lastReport := 0;
+          repeat
+            readCnt := fs.Read(chunk, SizeOf(chunk));
+            if readCnt <= 0 then Break;
+            if not InternetWriteFile(hRequest, @chunk[0], readCnt, written) then Exit;
+            Inc(done, written);
+            if Assigned(Progress) and (done - lastReport >= 1024*1024) then
+            begin
+              lastReport := done;
+              if Progress(done, total) then
+              begin
+                if AbortedPtr <> nil then AbortedPtr^ := True;
+                Exit;   // finally-blocks close the handles => aborted upload
+              end;
+            end;
+          until readCnt < SizeOf(chunk);
+
+          if not HttpEndRequest(hRequest, nil, 0, 0) then Exit;
+
+          statusBuf := 0; statusLen := SizeOf(statusBuf); idx := 0;
+          if HttpQueryInfo(hRequest, HTTP_QUERY_STATUS_CODE or HTTP_QUERY_FLAG_NUMBER,
+               @statusBuf, statusLen, idx) then
+            StatusCode := statusBuf;
+          BucketRegion := QueryHeader(hRequest, 'x-amz-bucket-region');
+          Result := True;
+        finally
+          InternetCloseHandle(hRequest);
+        end;
+      finally
+        InternetCloseHandle(hConnect);
+      end;
+    finally
+      InternetCloseHandle(hSession);
+    end;
+  finally
+    fs.Free;
+  end;
+end;
+
+function TS3Client.PutObjectFromFile(const Bucket, Key, LocalFile: string;
+  out Status: Integer; Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
+var br: string; attempt: Integer; aborted: Boolean;
+begin
+  Result := False;
+  if AbortedPtr <> nil then AbortedPtr^ := False;
+  for attempt := 0 to 1 do
+  begin
+    aborted := False;
+    PutOnce(Bucket, Key, LocalFile, Status, br, Progress, @aborted);
+    if aborted then
+    begin
+      if AbortedPtr <> nil then AbortedPtr^ := True;
+      Exit(False);
+    end;
+    if ((Status = 301) or (Status = 400)) and (br <> '') and (br <> FRegion) then
+    begin
+      FRegion := br;
+      Continue;                 // learned real region — retry once
+    end;
+    Break;
+  end;
+  Result := (Status = 200);
+end;
+
+function TS3Client.DeleteObject(const Bucket, Key: string; out Status: Integer): Boolean;
+var ms: TMemoryStream; br, uri: string; attempt: Integer;
+begin
+  Result := False;
+  uri := '/' + Bucket + '/' + UriEncode(Key, False);
+  for attempt := 0 to 1 do
+  begin
+    ms := TMemoryStream.Create;
+    try
+      SignedRequest('DELETE', RegionHost, uri, '', nil, ms, Status, br);
+    finally ms.Free; end;
+    if ((Status = 301) or (Status = 400)) and (br <> '') and (br <> FRegion) then
+      FRegion := br             // learned real region — retry once
+    else
+      Break;
+  end;
+  Result := (Status = 200) or (Status = 204);  // S3 returns 204 on delete
+end;
+
+function TS3Client.CreateFolder(const Bucket, Key: string; out Status: Integer): Boolean;
+var ms: TMemoryStream; br, uri: string; attempt: Integer;
+begin
+  Result := False;
+  uri := '/' + Bucket + '/' + UriEncode(Key, False);
+  for attempt := 0 to 1 do
+  begin
+    ms := TMemoryStream.Create;
+    try
+      // Empty payload => SignedRequest uses EMPTY_SHA256; PUT creates the marker.
+      SignedRequest('PUT', RegionHost, uri, '', nil, ms, Status, br);
+    finally ms.Free; end;
+    if ((Status = 301) or (Status = 400)) and (br <> '') and (br <> FRegion) then
+      FRegion := br             // learned real region — retry once
+    else
+      Break;
+  end;
+  Result := (Status = 200);
 end;
 
 end.
