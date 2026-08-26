@@ -218,17 +218,31 @@ begin
   StrLCopy(DefRootName, nm, MaxLen-1);
 end;
 
-function FsFindFirstW(Path: PWideChar; var FindData: TWin32FindDataW): THandle; stdcall;
+// The WideString/AnsiString work lives here so the exported FsFindFirstW holds
+// no managed locals. On Windows, freeing a WideString temp in the epilogue calls
+// SysFreeString (OLE), which resets the OS last-error to 0 — that would wipe the
+// SetLastError(ERROR_NO_MORE_FILES) we need for TC to treat an empty S3 "folder"
+// as an enterable empty dir rather than a read error.
+procedure FindFirstImpl(Path: PWideChar; var FindData: TWin32FindDataW; out isEmpty: Boolean);
 begin
   BuildListing(WideString(Path));
-  if Length(gList) = 0 then
-  begin
-    SetLastError(ERROR_NO_MORE_FILES);
-    Exit(THandle(INVALID_HANDLE_VALUE));
-  end;
+  isEmpty := Length(gList) = 0;
+  if isEmpty then Exit;
   gIndex := 0;
   FillFind(FindData, gList[0]);
-  Result := THandle(1);
+end;
+
+function FsFindFirstW(Path: PWideChar; var FindData: TWin32FindDataW): THandle; stdcall;
+var isEmpty: Boolean;
+begin
+  FindFirstImpl(Path, FindData, isEmpty);
+  if isEmpty then
+  begin
+    SetLastError(ERROR_NO_MORE_FILES);   // must be the last call — no managed temps here
+    Result := THandle(INVALID_HANDLE_VALUE);
+  end
+  else
+    Result := THandle(1);
 end;
 
 function FsFindNextW(Hdl: THandle; var FindData: TWin32FindDataW): LongBool; stdcall;
