@@ -19,15 +19,23 @@ type
     // Response body is STREAMED raw to RespStream (never buffered whole), so a
     // multi-GB download uses constant memory. On a region redirect the actual
     // bucket region is returned in BucketRegion so the caller can retry.
+    // ExtraHeaders (raw, CRLF-terminated) are sent but NOT signed — fine for
+    // Range/Content-Length which aren't in signedHeaders. StopPtr is read-only:
+    // if StopPtr^ becomes True mid-stream the read loop bails (parallel abort).
     function SignedRequest(const Method, Host, CanonicalUri, CanonicalQuery: string;
       const Payload: TBytes; RespStream: TStream;
       out StatusCode: Integer; out BucketRegion: string;
-      Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil): Boolean;
+      Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil;
+      const ExtraHeaders: string = ''; StopPtr: PBoolean = nil): Boolean;
     // One streaming PUT attempt (UNSIGNED-PAYLOAD); PutObjectFromFile wraps it
     // with the region-detect retry.
     function PutOnce(const Bucket, Key, LocalFile: string;
       out StatusCode: Integer; out BucketRegion: string;
       Progress: TS3Progress = nil; AbortedPtr: PBoolean = nil): Boolean;
+    // Parallel range download for large objects (see MultipartThreshold).
+    function GetObjectMultipart(const Bucket, Key, LocalFile: string;
+      TotalSize: Int64; out Status: Integer;
+      Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
   public
     constructor Create(const AAccess, ASecret, ARegion: string);
     property Region: string read FRegion write FRegion;
@@ -36,9 +44,11 @@ type
     // These auto-detect and follow the bucket's real region on a 301/400.
     function ListObjectsXML(const Bucket, Prefix: string;
       out Body: string; out Status: Integer): Boolean;
+    // TotalSize (from the caller's listing) lets big objects use a parallel
+    // multipart download; pass -1 if unknown to force the single stream.
     function GetObjectToFile(const Bucket, Key, LocalFile: string;
       out Status: Integer; Progress: TS3Progress = nil;
-      AbortedPtr: PBoolean = nil): Boolean;
+      AbortedPtr: PBoolean = nil; TotalSize: Int64 = -1): Boolean;
     // Streams the local file to S3 (constant memory) via PUT with
     // x-amz-content-sha256: UNSIGNED-PAYLOAD, so we never hash the whole file.
     function PutObjectFromFile(const Bucket, Key, LocalFile: string;
@@ -52,6 +62,11 @@ type
   end;
 
 function UriEncode(const S: string; EncodeSlash: Boolean): string;
+
+var
+  // Objects larger than this are downloaded in parallel byte-range parts.
+  // A plain var so tests can lower it; default 100 MB.
+  MultipartThreshold: Int64 = 100 * 1024 * 1024;
 
 implementation
 
@@ -117,7 +132,8 @@ end;
 function TS3Client.SignedRequest(const Method, Host, CanonicalUri, CanonicalQuery: string;
   const Payload: TBytes; RespStream: TStream;
   out StatusCode: Integer; out BucketRegion: string;
-  Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
+  Progress: TS3Progress; AbortedPtr: PBoolean;
+  const ExtraHeaders: string; StopPtr: PBoolean): Boolean;
 var
   amzDate, dateStamp, scope, canonicalHeaders, signedHeaders: string;
   canonicalRequest, stringToSign, authHeader, headers, payloadHash: string;
@@ -128,6 +144,7 @@ var
   bytesRead: DWORD;
   statusBuf, statusLen, idx: DWORD;
   optPtr: Pointer; optLen: DWORD;
+  timeoutMs, maxConns: DWORD;
   total, done, lastReport: Int64;
 begin
   Result := False; StatusCode := 0; BucketRegion := '';
@@ -167,11 +184,25 @@ begin
   headers :=
     'x-amz-date: ' + amzDate + #13#10 +
     'x-amz-content-sha256: ' + payloadHash + #13#10 +
-    'Authorization: ' + authHeader + #13#10;
+    'Authorization: ' + authHeader + #13#10 +
+    ExtraHeaders;   // unsigned wire headers (e.g. Range), already CRLF-terminated
 
   hSession := InternetOpen('fpcs3/1.0', INTERNET_OPEN_TYPE_PRECONFIG, nil, nil, 0);
   if hSession = nil then Exit;
   try
+    // Bound every blocking WinINet call so a dead/stalled socket can never hang
+    // a worker forever (root cause of the un-cancelable multipart download).
+    timeoutMs := 15000;
+    InternetSetOption(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, @timeoutMs, SizeOf(timeoutMs));
+    timeoutMs := 30000;
+    InternetSetOption(hSession, INTERNET_OPTION_SEND_TIMEOUT,    @timeoutMs, SizeOf(timeoutMs));
+    InternetSetOption(hSession, INTERNET_OPTION_RECEIVE_TIMEOUT, @timeoutMs, SizeOf(timeoutMs));
+    // Lift WinINet's default 2-connections-per-host cap so N parallel range
+    // workers all actually connect instead of starving (root cause of the
+    // stuck-at-0% progress bar). ponytail: 16 is plenty for a handful of parts.
+    maxConns := 16;
+    InternetSetOption(hSession, INTERNET_OPTION_MAX_CONNS_PER_SERVER,     @maxConns, SizeOf(maxConns));
+    InternetSetOption(hSession, INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER, @maxConns, SizeOf(maxConns));
     hConnect := InternetConnect(hSession, PChar(Host), INTERNET_DEFAULT_HTTPS_PORT,
       nil, nil, INTERNET_SERVICE_HTTP, 0, 0);
     if hConnect = nil then Exit;
@@ -203,6 +234,7 @@ begin
         done := 0; lastReport := 0;
         while InternetReadFile(hRequest, @buf[0], SizeOf(buf), bytesRead) and (bytesRead > 0) do
         begin
+          if (StopPtr <> nil) and StopPtr^ then Break;   // sibling failed / user aborted
           RespStream.WriteBuffer(buf[0], bytesRead);
           Inc(done, bytesRead);
           // report roughly every 1 MB so a huge file doesn't flood the callback
@@ -265,10 +297,203 @@ begin
   end;
 end;
 
+// ---- parallel multipart download ----------------------------------------
+type
+  // Shared, mostly-immutable context for one multipart download. Stop/Failed are
+  // LongBool flags flipped by workers/main; races are benign (all set to True).
+  TMultipartCtx = class
+    Client: TS3Client;
+    Host, Uri, LocalFile: string;
+    Stop, Failed: LongBool;
+  end;
+
+  // Wraps the target file stream and tallies bytes into a caller-owned counter
+  // (one counter per worker => single writer, no lock needed). SignedRequest
+  // only ever Writes, so Read/Seek just forward.
+  TCountingStream = class(TStream)
+  private
+    FInner: TStream; FCounter: PInt64;
+  public
+    constructor Create(AInner: TStream; ACounter: PInt64);
+    function Write(const Buffer; Count: Longint): Longint; override;
+    function Read(var Buffer; Count: Longint): Longint; override;
+    function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+  end;
+
+  // Downloads one byte range [FStart..FEnd] into its slice of the shared file,
+  // retrying up to 3 times. Writes at the range offset (own file handle), so
+  // workers never collide and no reassembly pass is needed.
+  TRangeWorker = class(TThread)
+  private
+    FCtx: TMultipartCtx;
+    FStart, FEnd, FWorkerDone: Int64;
+    FOk, FCompleted: Boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(ACtx: TMultipartCtx; AStart, AEnd: Int64);
+    property WorkerDone: Int64 read FWorkerDone;
+    property Ok: Boolean read FOk;
+    property Completed: Boolean read FCompleted;
+  end;
+
+constructor TCountingStream.Create(AInner: TStream; ACounter: PInt64);
+begin inherited Create; FInner := AInner; FCounter := ACounter; end;
+function TCountingStream.Write(const Buffer; Count: Longint): Longint;
+begin Result := FInner.Write(Buffer, Count); Inc(FCounter^, Result); end;
+function TCountingStream.Read(var Buffer; Count: Longint): Longint;
+begin Result := FInner.Read(Buffer, Count); end;
+function TCountingStream.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
+begin Result := FInner.Seek(Offset, Origin); end;
+
+constructor TRangeWorker.Create(ACtx: TMultipartCtx; AStart, AEnd: Int64);
+begin
+  inherited Create(True);         // suspended; caller Starts once all are built
+  FreeOnTerminate := False;
+  FCtx := ACtx; FStart := AStart; FEnd := AEnd;
+  FWorkerDone := 0; FOk := False; FCompleted := False;
+end;
+
+procedure TRangeWorker.Execute;
+var attempt, status: Integer; fs: TFileStream; cs: TCountingStream;
+    br, rangeHdr: string; expected: Int64;
+begin
+  expected := FEnd - FStart + 1;
+  for attempt := 1 to 3 do          // retry each part up to 3 times
+  begin
+    if FCtx.Stop then Break;
+    FWorkerDone := 0;               // this attempt overwrites the slice from scratch
+    fs := nil;
+    try fs := TFileStream.Create(FCtx.LocalFile, fmOpenReadWrite or fmShareDenyNone);
+    except fs := nil; end;
+    if fs = nil then begin Sleep(200); Continue; end;
+    cs := nil;
+    try
+      fs.Seek(FStart, soBeginning);
+      cs := TCountingStream.Create(fs, @FWorkerDone);
+      rangeHdr := 'Range: bytes=' + IntToStr(FStart) + '-' + IntToStr(FEnd) + #13#10;
+      FCtx.Client.SignedRequest('GET', FCtx.Host, FCtx.Uri, '', nil, cs,
+        status, br, nil, nil, rangeHdr, @FCtx.Stop);
+    finally
+      if cs <> nil then cs.Free;
+      fs.Free;
+    end;
+    if FCtx.Stop then Break;
+    if (status = 206) and (FWorkerDone = expected) then begin FOk := True; Break; end;
+    Sleep(300);                     // brief backoff before retrying
+  end;
+  if not FOk then begin FCtx.Failed := True; FCtx.Stop := True; end;  // make siblings bail
+  FCompleted := True;
+end;
+
+function TS3Client.GetObjectMultipart(const Bucket, Key, LocalFile: string;
+  TotalSize: Int64; out Status: Integer; Progress: TS3Progress;
+  AbortedPtr: PBoolean): Boolean;
+const NUM_WORKERS = 4;
+var
+  ctx: TMultipartCtx;
+  workers: array of TRangeWorker;
+  ms: TMemoryStream;
+  br, uri: string;
+  i, nParts, probeStatus, attempt: Integer;
+  partSize, rs, re, doneSum: Int64;
+  fs: TFileStream;
+  allDone, userAbort: Boolean;
+begin
+  Result := False; Status := 0;
+  if AbortedPtr <> nil then AbortedPtr^ := False;
+  uri := '/' + Bucket + '/' + UriEncode(Key, False);
+
+  // 1) settle the bucket region (and confirm reachability) with a 1-byte probe,
+  //    so the parallel workers never hit a 301 mid-flight and never mutate FRegion.
+  probeStatus := 0;
+  for attempt := 0 to 1 do
+  begin
+    ms := TMemoryStream.Create;
+    try
+      SignedRequest('GET', RegionHost, uri, '', nil, ms, probeStatus, br,
+        nil, nil, 'Range: bytes=0-0'#13#10);
+    finally ms.Free; end;
+    if ((probeStatus = 301) or (probeStatus = 400)) and (br <> '') and (br <> FRegion) then
+      FRegion := br
+    else
+      Break;
+  end;
+  Status := probeStatus;
+  if (probeStatus <> 206) and (probeStatus <> 200) then Exit(False);  // 403/404/etc
+
+  // 2) pre-size the output file so each worker can write at its offset.
+  try
+    fs := TFileStream.Create(LocalFile, fmCreate);
+    try fs.Size := TotalSize; finally fs.Free; end;
+  except
+    Status := 0; Exit(False);      // e.g. disk full
+  end;
+
+  // 3) split into contiguous parts, one worker each.
+  ctx := TMultipartCtx.Create;
+  ctx.Client := Self; ctx.Host := RegionHost; ctx.Uri := uri;
+  ctx.LocalFile := LocalFile; ctx.Stop := False; ctx.Failed := False;
+  nParts := NUM_WORKERS;
+  partSize := (TotalSize + nParts - 1) div nParts;
+  SetLength(workers, nParts);
+  for i := 0 to nParts - 1 do
+  begin
+    rs := Int64(i) * partSize;
+    re := rs + partSize - 1;
+    if re > TotalSize - 1 then re := TotalSize - 1;
+    workers[i] := TRangeWorker.Create(ctx, rs, re);
+  end;
+  for i := 0 to nParts - 1 do workers[i].Start;
+
+  // 4) main thread drives progress + abort while workers run (TC's callback must
+  //    be called from this thread, not the workers).
+  userAbort := False;
+  repeat
+    Sleep(100);
+    doneSum := 0;
+    for i := 0 to nParts - 1 do Inc(doneSum, workers[i].WorkerDone);
+    // Once abort is requested, stop polling TC's callback — the workers see
+    // ctx.Stop between reads and wind down on their own. Re-firing the callback
+    // every tick during teardown is exactly what produced the "error canceling"
+    // spam before; we just wait for the (now timeout-bounded) workers to finish.
+    if Assigned(Progress) and not userAbort then
+      if Progress(doneSum, TotalSize) then
+      begin ctx.Stop := True; userAbort := True; end;
+    allDone := True;
+    for i := 0 to nParts - 1 do if not workers[i].Completed then allDone := False;
+  until allDone;
+
+  // 5) join and collect verdicts.
+  Result := True;
+  for i := 0 to nParts - 1 do
+  begin
+    workers[i].WaitFor;
+    if not workers[i].Ok then Result := False;
+  end;
+  for i := 0 to nParts - 1 do workers[i].Free;
+  ctx.Free;
+
+  if userAbort then
+  begin
+    if AbortedPtr <> nil then AbortedPtr^ := True;
+    Result := False;
+  end;
+
+  if Result then
+    Status := 200
+  else
+    SysUtils.DeleteFile(LocalFile);   // any part failed/aborted => no partial file
+end;
+
 function TS3Client.GetObjectToFile(const Bucket, Key, LocalFile: string;
-  out Status: Integer; Progress: TS3Progress; AbortedPtr: PBoolean): Boolean;
+  out Status: Integer; Progress: TS3Progress; AbortedPtr: PBoolean;
+  TotalSize: Int64): Boolean;
 var fs: TFileStream; br, uri: string; attempt: Integer; aborted: Boolean;
 begin
+  if TotalSize > MultipartThreshold then
+    Exit(GetObjectMultipart(Bucket, Key, LocalFile, TotalSize, Status, Progress, AbortedPtr));
+
   Result := False;
   if AbortedPtr <> nil then AbortedPtr^ := False;
   uri := '/' + Bucket + '/' + UriEncode(Key, False);
