@@ -16,14 +16,6 @@ type
   TEntryArray = array of TEntry;
   PFindState  = ^TFindState;
   TFindState  = record List: TEntryArray; Index: Integer; end;
-  // TC's RemoteInfoStruct (fsplugin.h) — passed to FsGetFileW; gives the object
-  // size up front, so big files can use the parallel multipart download.
-  PRemoteInfo = ^TRemoteInfo;
-  TRemoteInfo = record
-    SizeLow, SizeHigh: LongWord;
-    LastWriteTime: FILETIME;
-    Attr: LongInt;
-  end;
   // Total Commander's progress callback: returns 1 if the user wants to abort.
   TProgressProcW = function(PluginNr: Integer; Source, Target: PWideChar;
     PercentDone: Integer): Integer; stdcall;
@@ -34,9 +26,6 @@ const
   FS_FILE_READERROR    = 3;
   FS_FILE_USERABORT    = 5;
   FS_FILE_NOTSUPPORTED = 6;
-  // ponytail: temporary diagnostic — appends the Find call sequence to
-  // %TEMP%\wfx-s3.log so we can see what TC actually does on Ctrl+B. Flip off.
-  DEBUG_LOG = True;
 
 var
   gS3: TS3Client = nil;
@@ -87,18 +76,6 @@ begin
   if region = '' then region := 'us-east-1'; // any region; auto-corrects per bucket
   Result := access <> '';
   if Result then gS3 := TS3Client.Create(access, secret, region);
-end;
-
-procedure LogLine(const s: string);
-var f: TextFile; path: string;
-begin
-  if not DEBUG_LOG then Exit;
-  path := GetTempDir + 'wfx-s3.log';
-  AssignFile(f, path);
-  {$I-}
-  if FileExists(path) then Append(f) else Rewrite(f);
-  if IOResult = 0 then begin WriteLn(f, s); CloseFile(f); end;
-  {$I+}
 end;
 
 // ---- xml + path helpers --------------------------------------------------
@@ -252,22 +229,9 @@ end;
 // Returns a heap PFindState (already positioned at entry 0 in FindData), or nil
 // for an empty listing. New/Dispose init/finalise the managed dynamic-array field.
 function FindFirstImpl(Path: PWideChar; var FindData: TWin32FindDataW): PFindState;
-var i: Integer; summary: string;
 begin
   New(Result);
   BuildListing(WideString(Path), Result^.List);
-  if DEBUG_LOG then
-  begin
-    summary := '';
-    for i := 0 to High(Result^.List) do
-    begin
-      if i >= 10 then begin summary := summary + '...'; Break; end;
-      if Result^.List[i].IsDir then summary := summary + '<D>' else summary := summary + '<F>';
-      summary := summary + Result^.List[i].Name + ' ';
-    end;
-    LogLine('FindFirst "' + string(WideString(Path)) + '" -> ' +
-      IntToStr(Length(Result^.List)) + ' entries: ' + summary);
-  end;
   if Length(Result^.List) = 0 then
   begin Dispose(Result); Exit(nil); end;
   Result^.Index := 0;
@@ -311,7 +275,7 @@ end;
 
 function FsGetFileW(RemoteName, LocalName: PWideChar; CopyFlags: Integer;
   RemoteInfo: Pointer): Integer; stdcall;
-var bucket, prefix, key: string; status: Integer; aborted: Boolean; total: Int64;
+var bucket, prefix, key: string; status: Integer; aborted: Boolean;
 begin
   if not EnsureClient then Exit(FS_FILE_READERROR);
   SplitPath(WideString(RemoteName), bucket, prefix);
@@ -321,16 +285,11 @@ begin
   if (key <> '') and (key[Length(key)] = '/') then Delete(key, Length(key), 1);
   if key = '' then Exit(FS_FILE_NOTSUPPORTED);
 
-  total := -1;   // TC gives us the size; big files -> parallel multipart download
-  if RemoteInfo <> nil then
-    total := (Int64(PRemoteInfo(RemoteInfo)^.SizeHigh) shl 32) or
-             PRemoteInfo(RemoteInfo)^.SizeLow;
-
   gCurSource := WideString(RemoteName);
   gCurTarget := WideString(LocalName);
   aborted := False;
   if gS3.GetObjectToFile(bucket, key, WideString(LocalName), status,
-       @ProgressBridge, @aborted, total) and (status = 200) then
+       @ProgressBridge, @aborted) and (status = 200) then
     Result := FS_FILE_OK
   else if aborted then
     Result := FS_FILE_USERABORT
