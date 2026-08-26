@@ -319,6 +319,31 @@ begin
   Result := gS3.CreateFolder(bucket, prefix, status) and (status = 200);
 end;
 
+function FsDeleteFileW(RemoteName: PWideChar): BOOL; stdcall;
+var bucket, prefix, key: string; status: Integer;
+begin
+  if not EnsureClient then Exit(False);
+  SplitPath(WideString(RemoteName), bucket, prefix);
+  if bucket = '' then Exit(False);   // can't delete a bucket via file-delete
+  key := prefix;                     // prefix is the full key + trailing '/'
+  if (key <> '') and (key[Length(key)] = '/') then Delete(key, Length(key), 1);
+  if key = '' then Exit(False);
+  Result := gS3.DeleteObject(bucket, key, status);
+end;
+
+function FsRemoveDirW(RemoteName: PWideChar): BOOL; stdcall;
+var bucket, prefix: string; status: Integer;
+begin
+  if not EnsureClient then Exit(False);
+  SplitPath(WideString(RemoteName), bucket, prefix);
+  // ponytail: TC deletes a folder's contents first (it enumerates and calls
+  // FsDeleteFile/FsRemoveDir recursively), so we only remove the empty S3
+  // folder-marker object here. DeleteObject is idempotent (204) if there is
+  // no explicit marker, so an implicit folder deletes cleanly too.
+  if (bucket = '') or (prefix = '') then Exit(False);  // '' = a bucket, out of scope
+  Result := gS3.DeleteObject(bucket, prefix, status);
+end;
+
 exports
   FsInitW          name 'FsInitW',
   FsGetDefRootName name 'FsGetDefRootName',
@@ -327,7 +352,9 @@ exports
   FsFindClose      name 'FsFindClose',
   FsGetFileW       name 'FsGetFileW',
   FsPutFileW       name 'FsPutFileW',
-  FsMkDirW         name 'FsMkDirW';
+  FsMkDirW         name 'FsMkDirW',
+  FsDeleteFileW    name 'FsDeleteFileW',
+  FsRemoveDirW     name 'FsRemoveDirW';
 
 begin
 end.
