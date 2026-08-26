@@ -11,6 +11,11 @@ type
     IsDir: Boolean;
     Size: Int64;
   end;
+  // Per-handle Find cursor: FsFindFirstW returns THandle(a heap PFindState), so
+  // Branch View's interleaved parent/child enumerations don't stomp each other.
+  TEntryArray = array of TEntry;
+  PFindState  = ^TFindState;
+  TFindState  = record List: TEntryArray; Index: Integer; end;
   // Total Commander's progress callback: returns 1 if the user wants to abort.
   TProgressProcW = function(PluginNr: Integer; Source, Target: PWideChar;
     PercentDone: Integer): Integer; stdcall;
@@ -24,8 +29,6 @@ const
 
 var
   gS3: TS3Client = nil;
-  gList: array of TEntry;
-  gIndex: Integer = -1;
   gProgressProc: TProgressProcW = nil;
   gPluginNr: Integer = 0;
   gCurSource, gCurTarget: WideString;
@@ -114,14 +117,14 @@ begin
 end;
 
 // ---- build the directory listing for a TC path ---------------------------
-procedure BuildListing(const tcPath: string);
+procedure BuildListing(const tcPath: string; var outList: TEntryArray);
 var
   bucket, prefix, body: string;
   status, i: Integer;
   names, prefixes, keys, sizes: TStringList;
   e: TEntry;
 begin
-  SetLength(gList, 0);
+  SetLength(outList, 0);
   if not EnsureClient then Exit;
 
   SplitPath(tcPath, bucket, prefix);
@@ -137,7 +140,7 @@ begin
       for i := 0 to names.Count-1 do
       begin
         e.Name := names[i]; e.IsDir := True; e.Size := 0;
-        SetLength(gList, Length(gList)+1); gList[High(gList)] := e;
+        SetLength(outList, Length(outList)+1); outList[High(outList)] := e;
       end;
     finally names.Free; end;
     Exit;
@@ -161,7 +164,7 @@ begin
       if prefixes[i] = prefix then Continue;      // the request prefix echoes back
       e.Name := LastSegment(prefixes[i]); e.IsDir := True; e.Size := 0;
       if e.Name <> '' then
-      begin SetLength(gList, Length(gList)+1); gList[High(gList)] := e; end;
+      begin SetLength(outList, Length(outList)+1); outList[High(outList)] := e; end;
     end;
     // files (Contents)
     for i := 0 to keys.Count-1 do
@@ -172,7 +175,7 @@ begin
       e.IsDir := False;
       if i < sizes.Count then e.Size := StrToInt64Def(sizes[i], 0) else e.Size := 0;
       if e.Name <> '' then
-      begin SetLength(gList, Length(gList)+1); gList[High(gList)] := e; end;
+      begin SetLength(outList, Length(outList)+1); outList[High(outList)] := e; end;
     end;
   finally
     prefixes.Free; keys.Free; sizes.Free;
@@ -223,38 +226,50 @@ end;
 // SysFreeString (OLE), which resets the OS last-error to 0 — that would wipe the
 // SetLastError(ERROR_NO_MORE_FILES) we need for TC to treat an empty S3 "folder"
 // as an enterable empty dir rather than a read error.
-procedure FindFirstImpl(Path: PWideChar; var FindData: TWin32FindDataW; out isEmpty: Boolean);
+// Returns a heap PFindState (already positioned at entry 0 in FindData), or nil
+// for an empty listing. New/Dispose init/finalise the managed dynamic-array field.
+function FindFirstImpl(Path: PWideChar; var FindData: TWin32FindDataW): PFindState;
 begin
-  BuildListing(WideString(Path));
-  isEmpty := Length(gList) = 0;
-  if isEmpty then Exit;
-  gIndex := 0;
-  FillFind(FindData, gList[0]);
+  New(Result);
+  BuildListing(WideString(Path), Result^.List);
+  if Length(Result^.List) = 0 then
+  begin Dispose(Result); Exit(nil); end;
+  Result^.Index := 0;
+  FillFind(FindData, Result^.List[0]);
 end;
 
 function FsFindFirstW(Path: PWideChar; var FindData: TWin32FindDataW): THandle; stdcall;
-var isEmpty: Boolean;
+var st: PFindState; isEmpty: Boolean;
 begin
-  FindFirstImpl(Path, FindData, isEmpty);
+  st := FindFirstImpl(Path, FindData);   // holds all managed temps
+  isEmpty := st = nil;
+  // Only a pointer + Boolean live past here, so the epilogue frees no WideString
+  // and SysFreeString won't clobber the last-error we set for empty dirs.
   if isEmpty then
   begin
     SetLastError(ERROR_NO_MORE_FILES);   // must be the last call — no managed temps here
     Result := THandle(INVALID_HANDLE_VALUE);
   end
   else
-    Result := THandle(1);
+    Result := THandle(st);
 end;
 
 function FsFindNextW(Hdl: THandle; var FindData: TWin32FindDataW): LongBool; stdcall;
+var st: PFindState;
 begin
-  Inc(gIndex);
-  if (gIndex < 0) or (gIndex >= Length(gList)) then Exit(False);
-  FillFind(FindData, gList[gIndex]);
+  st := PFindState(Hdl);
+  if st = nil then Exit(False);
+  Inc(st^.Index);
+  if (st^.Index < 0) or (st^.Index >= Length(st^.List)) then Exit(False);
+  FillFind(FindData, st^.List[st^.Index]);
   Result := True;
 end;
 
 function FsFindClose(Hdl: THandle): Integer; stdcall;
+var st: PFindState;
 begin
+  st := PFindState(Hdl);
+  if st <> nil then Dispose(st);
   Result := 0;
 end;
 
