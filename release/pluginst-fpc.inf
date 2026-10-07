@@ -1,0 +1,7 @@
+[plugininstall]
+description=WvN S3 plugin (Free Pascal build, 64-bit)
+type=wfx
+file=WvN-S3-fpc.wfx64
+file=pluginst.inf
+defaultdir=WvN-S3-fpc
+version=1.0.0

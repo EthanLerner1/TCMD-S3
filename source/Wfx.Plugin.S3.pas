@@ -103,6 +103,38 @@ begin
     end;
   end;
 
+  // ponytail: the AWS CLI keeps region in ~/.aws/config, and may keep the keys
+  // there too (there is often no ~/.aws/credentials file at all). Fall back to it.
+  // config sections are [default] and [profile NAME].
+  const config = TPath.Combine(TPath.Combine(awsPath,'.aws'),'config');
+  if TFile.Exists(config) then
+  begin
+    var cfgSection := 'profile ' + FProfile;
+    if SameText(FProfile, 'default') then
+      cfgSection := 'default';
+    const ini = TIniFile.Create(config);
+    try
+      if AccountName = '' then
+        AccountName := ini.ReadString(cfgSection, 'aws_access_key_id', AccountName);
+      if AccountKey = '' then
+        AccountKey  := ini.ReadString(cfgSection, 'aws_secret_access_key', AccountKey);
+      FRegion := ini.ReadString(cfgSection, 'region', FRegion);
+      if FProfiles.Count = 0 then
+      begin
+        var LSections := TStringList.Create;
+        try
+          ini.ReadSections(LSections);
+          for var s in LSections do
+            FProfiles.Add(s.Replace('profile ', ''));
+        finally
+          LSections.Free;
+        end;
+      end;
+    finally
+      ini.Free;
+    end;
+  end;
+
   FConnectionInfo.Free;
   FConnectionInfo             := TAmazonConnectionInfo.Create(nil);
   FConnectionInfo.AccountName := AccountName;
@@ -256,8 +288,22 @@ begin
     pmPickBucket:
       begin
         FFileList.Add(FPickProfile);
-        FBuckets := S3.ListBuckets;
-        LogDebug('Retrieved bucket list');
+        var res := TCloudResponseInfo.Create;
+        try
+          FBuckets.Free;
+          FBuckets := S3.ListBuckets(res);
+          LogDebug('Retrieved bucket list: ' + res.StatusMessage);
+          // ponytail: ListBuckets used to swallow the AWS response, so any auth /
+          // permission / region error just showed as "no buckets". Surface it.
+          if (FBuckets = nil) or (FBuckets.Count = 0) then
+            TCShowMessage('No buckets returned by AWS',
+              Format('HTTP %d %s'#13#10#13#10'Profile: %s'#13#10'Region: %s',
+                [res.StatusCode, res.StatusMessage, FProfile, FRegion]));
+        finally
+          res.Free;
+        end;
+        if FBuckets = nil then
+          FBuckets := TStringList.Create;
         for var bucketName in FBuckets do
         begin
           var FileInfo:= TFileInfo.Create;

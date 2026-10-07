@@ -9,10 +9,10 @@ set DELPHI_PROJECT=..\source\S3.dproj
 
 call "%DELPHI_BIN%\rsvars.bat"
 
-msbuild "%DELPHI_PROJECT%" /t:Build /p:Config=Release /p:Platform=Win32
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Msbuild\Current\Bin\MSBuild.exe" "%DELPHI_PROJECT%" /t:Build /p:Config=Release /p:Platform=Win32
 copy ..\bin\S3.wfx ..\release\WvN-S3.wfx
 
-msbuild "%DELPHI_PROJECT%" /t:Build /p:Config=Release /p:Platform=Win64
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Msbuild\Current\Bin\MSBuild.exe" "%DELPHI_PROJECT%" /t:Build /p:Config=Release /p:Platform=Win64
 copy ..\bin\S3.wfx64 ..\release\WvN-S3.wfx64
 copy ..\res\pluginst.inf ..\release\pluginst.inf
 copy ..\README.md ..\release\README.md

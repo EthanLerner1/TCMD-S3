@@ -16,41 +16,6 @@ It lets you browse and manage files in your [Amazon S3 buckets](https://aws.amaz
 
 Get it here: [Downloads](https://github.com/WouterVanNifterick/wfx-s3-wvn/tags)
 
-> **This fork** ([EthanLerner1/TCMD-S3](https://github.com/EthanLerner1/TCMD-S3))
-> adds a **Free Pascal build** and several fixes/features — see
-> [What's new in this fork](#whats-new-in-this-fork).
->
-> _The changes in this fork, and this section of the README, were written with the help of AI (Claude Code)._
-
-## What's new in this fork
-
-A self-contained **Free Pascal (FPC)** port of the plugin lives in [`fpc/`](fpc/).
-It compiles to `WvN-S3-fpc.wfx64` with the free [Free Pascal / Lazarus](https://www.lazarus-ide.org/)
-toolchain — **no paid Embarcadero RAD Studio required**. It talks to S3 directly
-over HTTPS (WinINet + a hand-rolled AWS SigV4 signer), so it has no external
-dependencies (no OpenSSL, no AWS SDK).
-
-**Fixes**
-* **No buckets shown** — credentials are now read from both `~/.aws/credentials`
-  and `~/.aws/config` (`[default]` / `[profile NAME]`).
-* **`301 Moved Permanently`** when entering a bucket — the bucket's real region is
-  now auto-detected (via `x-amz-bucket-region`) and the request retried, instead
-  of assuming one fixed region.
-* **Couldn't open a folder named the same as its bucket** — path translation now
-  strips the leading bucket segment by position instead of by name.
-* **Total Commander froze on multi-GB downloads** — downloads now stream straight
-  to disk in constant memory, with a working progress bar and abort.
-* **Freshly-created empty folders couldn't be opened** — fixed an FPC/Windows
-  quirk where the "empty directory" signal was being lost.
-
-**New operations (FPC build)**
-* **Upload** files (streaming PUT, constant memory, progress + abort).
-* **Create folder**.
-* **Delete files** and **delete folders**.
-
-> ⚠️ Single-file uploads are currently capped at **4 GB** (a WinINet limit);
-> multipart upload for larger files is not implemented yet.
-
 #### What is S3?
 S3 is a cloud storage service provided by Amazon Web Services (AWS). 
 For small amounts of data, it's free. For larger amounts, it's very cheap. It can be used to store backups, or to host static websites.
@@ -146,7 +111,7 @@ It'll ask you to confirm the deletion. Watch out, because this is irreversible!
 * [x] Renaming files
 * [x] Copying/moving files between **two S3 buckets**
 * [x] Deleting files
-* [x] Deleting folders
+* [ ] Deleting folders
 * [ ] Setting permissions
 * [ ] Setting / Viewing metadata
 * [ ] Viewing object version history
